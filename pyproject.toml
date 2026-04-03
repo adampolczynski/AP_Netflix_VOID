@@ -1,6 +1,6 @@
 [project]
 name = "ap-netflix-void"
-version = "1.0.0"
+version = "1.1.0"
 description = "ComfyUI custom nodes for the Netflix VOID video inpainting model (CogVideoX-5B architecture)"
 license = { file = "LICENSE" }
 readme = "README.md"

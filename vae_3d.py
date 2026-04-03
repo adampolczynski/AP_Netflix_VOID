@@ -47,10 +47,13 @@ class _CausalConvWrapper(nn.Module):
         self.conv = nn.Conv3d(in_c, out_c, kernel_size, stride=stride, padding=0)
 
     def forward(self, x):
-        # F.pad order (last dim first): w_left w_right h_left h_right t_left t_right
-        x = F.pad(x, (self.w_pad, self.w_pad,
-                      self.h_pad, self.h_pad,
-                      self.t_pad, 0))
+        # Causal temporal padding: replicate first frame (matching official CogVideoX)
+        if self.t_pad > 0:
+            x = torch.cat([x[:, :, :1]] * self.t_pad + [x], dim=2)
+        # Spatial zero-padding
+        if self.h_pad > 0 or self.w_pad > 0:
+            x = F.pad(x, (self.w_pad, self.w_pad,
+                          self.h_pad, self.h_pad))
         return self.conv(x)
 
 

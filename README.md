@@ -63,7 +63,7 @@ Encodes a text prompt with a T5-XXL CLIP model → **CONDITIONING**
 Connect a `CLIPLoader` (T5-XXL) to the `clip` input.
 
 > **Prompt tip:** Describe the scene **after** the object is removed — what the clean background looks like. Do **not** describe the object being removed.
-> - ✅ `"A table with a cup on it."`
+> - ✅ `"wooden table, warm lighting"` (what should be there after removal)
 > - ❌ `"A person being removed from the scene."`
 
 ---
@@ -103,7 +103,7 @@ Main inpainting node. Encodes image + quadmask, runs DDIM, decodes output.
 | `negative` | CONDITIONING | Negative prompt (quality artifacts, watermarks, etc.) |
 | `num_frames` | INT | Frames to process. Use `4k+1` values: 1, 5, 9, 13, 17, 49, 97, 197 |
 | `steps` | INT | DDIM steps — official default: **50** |
-| `cfg` | FLOAT | CFG scale — official default: **1.0** (no CFG). Set higher only with a negative prompt |
+| `cfg` | FLOAT | CFG scale — recommended: **6.0** (matches official VOID pipeline) |
 | `seed` | INT | RNG seed |
 | `eta` | FLOAT | 0 = deterministic DDIM, 1 = DDPM stochastic |
 | `denoise` | FLOAT | Official default: **1.0** (full noise from scratch) |
@@ -134,7 +134,9 @@ Re-decodes a VOID LATENT using the 3D VAE without re-running the sampler.
 
 - **Resolution:** 384×672 pixels (H×W) is the training resolution. Other sizes work but quality may degrade.
 - **Frame count:** Must be `4k+1` for perfect VAE round-trip: 1, 5, 9, 13, 17, 49, 97, 197. Max: **197 frames**.
-- **CFG:** The official pipeline uses `guidance_scale=1.0` — essentially no CFG. Higher values require a meaningful negative prompt.
+- **CFG:** Use `6.0` — the official VOID pipeline default. `1.0` disables CFG entirely and results in the model ignoring the positive prompt, producing poor removals.
+- **Mask convention:** The `VoidQuadMask` node outputs black (0) = remove, white (1) = keep. Pass this directly to the sampler. Do **not** use `InvertMask` before it.
+- **Text embeddings:** Prompts are internally padded to 226 tokens (the training sequence length). No padding node needed.
 - **VAE scaling factor:** 0.7 (correct for both THUDM CogVideoX-5b and alibaba-pai CogVideoX-Fun-V1.5).
 - **Text encoder:** Must be **T5-XXL** (4096-dim). CLIP L/G will produce silent conditioning.
 

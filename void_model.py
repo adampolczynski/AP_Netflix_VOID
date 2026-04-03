@@ -24,7 +24,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 
 # ---------------------------------------------------------------------------
@@ -54,48 +53,51 @@ ROPE_THETA         = 10000
 # 3D RoPE utilities (mirrors comfy/ldm/flux/math.py  'rope' function)
 # ---------------------------------------------------------------------------
 
-def _rope_freqs(pos: torch.Tensor, dim: int, theta: float = 10000.0) -> torch.Tensor:
-    """Compute rotation matrices for one axis.
+def _rope_1d_freqs(pos: torch.Tensor, dim: int, theta: float = 10000.0):
+    """Compute (cos, sin) for one positional axis — CogVideoX split-at-midpoint style.
 
-    pos:  [B, L]  integer positions
-    return: [B, L, dim//2, 2, 2]  (2×2 rotation matrices)
+    pos:  [L]  float positions
+    Returns: (cos, sin) each [L, dim//2]
     """
     assert dim % 2 == 0
-    if pos.device.type in ("mps",):
-        device = torch.device("cpu")
-    else:
-        device = pos.device
-    scale = torch.linspace(0, (dim - 2) / dim, steps=dim // 2,
-                           dtype=torch.float64, device=device)
-    omega = 1.0 / (theta ** scale)                             # [dim//2]
-    # outer product of positions and frequencies
-    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
-    # build 2×2 rotation matrices: [[cos, -sin], [sin, cos]]
-    out = torch.stack([torch.cos(out), -torch.sin(out),
-                       torch.sin(out),  torch.cos(out)], dim=-1)
-    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out.to(dtype=torch.float32, device=pos.device)
+    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim  # [dim//2]
+    omega = 1.0 / (theta ** scale)                                                   # [dim//2]
+    freqs = torch.einsum("n,d->nd", pos.float(), omega)                              # [L, dim//2]
+    return torch.cos(freqs), torch.sin(freqs)
 
 
-def _apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply RoPE rotation matrices to x.
+def _apply_rope_cogvx(x: torch.Tensor,
+                      freqs_cos: torch.Tensor,
+                      freqs_sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to x using CogVideoX interleaved-pairs convention.
 
-    x:         [B, L, num_heads, head_dim]
-    freqs_cis: [B, 1,  L, head_dim//2, 2, 2]  – stacked per-axis
+    The official diffusers CogVideoX implementation pairs consecutive elements
+    (x[2k], x[2k+1]) with frequency index k.  This matches the
+    ``repeat_interleave(2)`` expansion in ``get_1d_rotary_pos_embed`` combined
+    with the ``reshape(-1, 2).unbind(-1)`` in ``apply_rotary_emb``.
+
+    x:          [B, L, num_heads, head_dim]
+    freqs_cos:  [L, head_dim//2]
+    freqs_sin:  [L, head_dim//2]
     """
-    # reshape x to pairs
-    x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
-    if x_.shape[2] != 1 and freqs_cis.shape[2] != 1 and x_.shape[2] != freqs_cis.shape[2]:
-        freqs_cis = freqs_cis[:, :, :x_.shape[2]]
-    x_out = freqs_cis[..., 0] * x_[..., 0]
-    x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
-    return x_out.reshape(*x.shape).type_as(x)
+    # Reshape into consecutive pairs: (x[0],x[1]), (x[2],x[3]), ...
+    x_pairs = x.reshape(*x.shape[:-1], -1, 2)                    # [B, L, nh, hd//2, 2]
+    x_real = x_pairs[..., 0]                                     # even indices  [B, L, nh, hd//2]
+    x_imag = x_pairs[..., 1]                                     # odd indices   [B, L, nh, hd//2]
+
+    cos = freqs_cos.unsqueeze(0).unsqueeze(2).to(dtype=x.dtype)  # [1, L, 1, hd//2]
+    sin = freqs_sin.unsqueeze(0).unsqueeze(2).to(dtype=x.dtype)  # [1, L, 1, hd//2]
+
+    out_real = x_real * cos - x_imag * sin                        # [B, L, nh, hd//2]
+    out_imag = x_imag * cos + x_real * sin                        # [B, L, nh, hd//2]
+
+    return torch.stack([out_real, out_imag], dim=-1).flatten(-2).type_as(x)
 
 
-def compute_3d_pe(T: int, H: int, W: int, device, dtype) -> torch.Tensor:
-    """Build 3D RoPE cosine/sine matrices for (T, H, W) grid.
+def compute_3d_pe(T: int, H: int, W: int, device, dtype):
+    """Build 3D RoPE (cos, sin) for (T, H, W) token grid.
 
-    Returns: [1, 1, T*H*W, HEAD_DIM//2, 2, 2]  – used as freqs_cis.
+    Returns: (cos, sin) each [T*H*W, HEAD_DIM//2]
     """
     t_ids = torch.arange(T, device=device, dtype=torch.float32)
     h_ids = torch.arange(H, device=device, dtype=torch.float32)
@@ -106,18 +108,13 @@ def compute_3d_pe(T: int, H: int, W: int, device, dtype) -> torch.Tensor:
     h_pos = hh.flatten()
     w_pos = ww.flatten()
 
-    L = t_pos.shape[0]
+    cos_t, sin_t = _rope_1d_freqs(t_pos, ROPE_AXES_DIM[0], ROPE_THETA)  # [L, 8]
+    cos_h, sin_h = _rope_1d_freqs(h_pos, ROPE_AXES_DIM[1], ROPE_THETA)  # [L, 12]
+    cos_w, sin_w = _rope_1d_freqs(w_pos, ROPE_AXES_DIM[2], ROPE_THETA)  # [L, 12]
 
-    # Each axis contributes (axis_dim/2) rotation-matrix pairs
-    # Shape per axis: [L, axis_dim//2, 2, 2]  → broadcast over batch+head
-    rot_t = _rope_freqs(t_pos.unsqueeze(0), ROPE_AXES_DIM[0], ROPE_THETA)  # [1, L, d_t//2, 2, 2]
-    rot_h = _rope_freqs(h_pos.unsqueeze(0), ROPE_AXES_DIM[1], ROPE_THETA)  # [1, L, d_h//2, 2, 2]
-    rot_w = _rope_freqs(w_pos.unsqueeze(0), ROPE_AXES_DIM[2], ROPE_THETA)  # [1, L, d_w//2, 2, 2]
-
-    # Concatenate along the frequency dimension
-    freqs = torch.cat([rot_t, rot_h, rot_w], dim=2)  # [1, L, HEAD_DIM//2, 2, 2]
-    freqs = freqs.unsqueeze(1)                         # [1, 1, L, HEAD_DIM//2, 2, 2]
-    return freqs.to(dtype=torch.float32)
+    cos = torch.cat([cos_t, cos_h, cos_w], dim=-1)  # [L, 32] = [L, HEAD_DIM//2]
+    sin = torch.cat([sin_t, sin_h, sin_w], dim=-1)  # [L, 32]
+    return cos, sin
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +263,11 @@ class VoidAttention(nn.Module):
         self.norm_k  = nn.LayerNorm(HEAD_DIM, elementwise_affine=True, eps=1e-5)
 
     def forward(self, combined: torch.Tensor, txt_len: int,
-                freqs: torch.Tensor) -> tuple:
+                freqs) -> tuple:
         """
         combined: [B, S+L, HIDDEN_SIZE]  (text prefix + video tokens)
         txt_len:  number of text tokens (prefix)
-        freqs:    [1, 1, L, HEAD_DIM//2, 2, 2]  3D RoPE for video tokens
+        freqs:    (cos, sin) each [L, HEAD_DIM//2]  3D RoPE for video tokens
 
         Returns: vid_out [B, L, H], txt_out [B, S, H]
         """
@@ -289,10 +286,13 @@ class VoidAttention(nn.Module):
         Q = self.norm_q(Q)
         K = self.norm_k(K)
 
-        # Apply 3D RoPE to video tokens only
+        # Apply 3D RoPE to video tokens only (CogVideoX split-at-midpoint style)
         if freqs is not None and vid_len > 0:
-            Q_vid = _apply_rope1(Q[:, txt_len:, :, :], freqs.to(Q.device))
-            K_vid = _apply_rope1(K[:, txt_len:, :, :], freqs.to(K.device))
+            freqs_cos, freqs_sin = freqs
+            Q_vid = _apply_rope_cogvx(Q[:, txt_len:, :, :],
+                                      freqs_cos.to(Q.device), freqs_sin.to(Q.device))
+            K_vid = _apply_rope_cogvx(K[:, txt_len:, :, :],
+                                      freqs_cos.to(K.device), freqs_sin.to(K.device))
             Q = torch.cat([Q[:, :txt_len], Q_vid], dim=1)
             K = torch.cat([K[:, :txt_len], K_vid], dim=1)
 
@@ -367,7 +367,7 @@ class VoidBlock(nn.Module):
         self.ff    = VoidFeedForward()
 
     def forward(self, vid_tokens: torch.Tensor, txt_tokens: torch.Tensor,
-                temb: torch.Tensor, freqs: torch.Tensor) -> tuple:
+                temb: torch.Tensor, freqs) -> tuple:
         """
         Returns updated (vid_tokens, txt_tokens)
         """
@@ -426,6 +426,13 @@ class VoidTransformer(nn.Module):
         """
         B, _, T, H, W = video.shape
 
+        # CogVideoX-1.5 (patch_size_t=2) requires an even temporal dimension.
+        # When a single frame is processed, pad to 2 and trim the output.
+        actual_T = T
+        if T == 1:
+            video = torch.cat([video, torch.zeros_like(video)], dim=2)  # [B, 48, 2, H, W]
+            T = 2
+
         # Temporal / spatial grid sizes after patching
         T_p = T // TEMPORAL_PATCH
         H_p = H // SPATIAL_PATCH
@@ -437,9 +444,9 @@ class VoidTransformer(nn.Module):
         # 2. Patch embed
         vid_tokens, txt_tokens, T_p_, H_p_, W_p_ = self.patch_embed(video, text_embeds)
 
-        # 3. Precompute 3D RoPE for video tokens
+        # 3. Precompute 3D RoPE for video tokens (returns (cos, sin) tuple)
         freqs = compute_3d_pe(T_p, H_p, W_p, device=video.device,
-                              dtype=video.dtype)                         # [1,1,L, head_dim//2, 2, 2]
+                              dtype=video.dtype)                         # (cos, sin) each [L, HEAD_DIM//2]
 
         # 4. Transformer blocks
         for block in self.transformer_blocks:
@@ -452,6 +459,11 @@ class VoidTransformer(nn.Module):
 
         # 6. Un-patch 3D
         out = _unpatch3d(vid_tokens, B, T_p, H_p, W_p)                  # [B, 16, T, H, W]
+
+        # Trim zero-padded frame if we added one for patch_size_t=2
+        if actual_T == 1:
+            out = out[:, :, :1, :, :]
+
         return out
 
 
@@ -470,15 +482,46 @@ def _unpatch3d(tokens: torch.Tensor, B: int, T_p: int, H_p: int, W_p: int) -> to
 # ---------------------------------------------------------------------------
 # Noise schedule helpers (CogVideoX-5B defaults)
 # ---------------------------------------------------------------------------
+# Official schedule from CogVideoX-Fun-V1.5-5b-InP/scheduler/scheduler_config.json:
+#   beta_schedule = "scaled_linear"
+#   beta_start = 0.00085, beta_end = 0.012
+#   rescale_betas_zero_snr = true
+#   timestep_spacing = "trailing"
+#   prediction_type = "v_prediction"
 
-def _betas_linear(num_train=1000, beta_start=0.00085, beta_end=0.012) -> torch.Tensor:
-    """Linear beta schedule — CogVideoX-Fun / VOID default (DDIMScheduler)."""
-    return torch.linspace(beta_start, beta_end, num_train)
+def _betas_scaled_linear(num_train=1000, beta_start=0.00085, beta_end=0.012) -> torch.Tensor:
+    """Scaled-linear (quadratic) beta schedule — matches CogVideoX/diffusers default."""
+    return torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_train, dtype=torch.float64) ** 2
+
+
+def _rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
+    """Rescale betas so that the terminal SNR is exactly zero (α_cumprod[-1]=0).
+
+    Reference: "Common Diffusion Noise Schedules and Sample Steps are Flawed"
+    (https://arxiv.org/abs/2305.08891)
+    Implementation matches diffusers.schedulers.scheduling_utils.rescale_zero_terminal_snr.
+    """
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    sqrt_acp = alphas_cumprod.sqrt()
+
+    sqrt_acp_0 = sqrt_acp[0].clone()
+    sqrt_acp_T = sqrt_acp[-1].clone()
+
+    # Shift so that terminal value is zero, rescale so initial value is preserved
+    sqrt_acp = (sqrt_acp - sqrt_acp_T) * sqrt_acp_0 / (sqrt_acp_0 - sqrt_acp_T)
+
+    # Convert back to betas
+    alphas_bar = sqrt_acp ** 2
+    alphas = alphas_bar[1:] / alphas_bar[:-1]
+    alphas = torch.cat([alphas_bar[0:1], alphas])
+    return (1 - alphas).to(torch.float32)
 
 
 def build_alphas_cumprod(num_train: int = 1000) -> torch.Tensor:
-    betas = _betas_linear(num_train)
-    alphas = 1.0 - betas
+    betas = _betas_scaled_linear(num_train)
+    betas = _rescale_zero_terminal_snr(betas)
+    alphas = 1.0 - betas.float()
     return torch.cumprod(alphas, dim=0)
 
 

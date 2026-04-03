@@ -266,7 +266,7 @@ class VoidSampler:
                 "num_frames":   ("INT",  {"default": 1, "min": 1, "max": 32,
                                           "tooltip": "Video frames (1 = single image)"}),
                 "steps":        ("INT",  {"default": 50, "min": 1, "max": 200}),
-                "cfg":          ("FLOAT",{"default": 1.0, "min": 1.0, "max": 20.0, "step": 0.1}),
+                "cfg":          ("FLOAT",{"default": 6.0, "min": 1.0, "max": 20.0, "step": 0.1}),
                 "seed":         ("INT",  {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "eta":          ("FLOAT",{"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                                           "tooltip": "0=deterministic DDIM, 1=DDPM stochastic"}),
@@ -302,19 +302,25 @@ class VoidSampler:
         # 1-channel mask at latent resolution — for final compositing only
         mask_lat = _prepare_mask_3d(mask_b, latT, Lh, Lw, device)
 
-        # Block 2: VAE-encode the INVERTED mask.
-        # Official VOID pipeline: encode (1 - mask_condition) in [0, 1] range.
-        # Inverted: cup=1.0, background=0.0. Values stay in [0,1], NOT [-1,+1].
-        mask_vae = _encode_mask_vae(vae, 1.0 - mask_b, T, device)  # [B, 16, T', Lh, Lw]
+        # Block 2: VAE-encode the mask.
+        # Official VOID pipeline: encode (1 - mask_condition) in [0, 1] range,
+        # where mask_condition has cup=1.0, background=0.0.
+        # VoidQuadMask already outputs VOID convention: cup=0.0, background=1.0,
+        # which is identical to (1 - mask_condition). Pass mask_b directly.
+        mask_vae = _encode_mask_vae(vae, mask_b, T, device)  # [B, 16, T', Lh, Lw]
 
         # Block 3: full original video latent (zero_out_mask_region=False).
         # Official VOID: the model sees the cup as context and generates the background.
         # No cup-zeroing — just use lat as-is.
 
         # ── 3. Pad to model grid requirements ─────────────────────────────
-        lat        = _ensure_even_temporal(_ensure_spatial_div(lat))
-        mask_pad   = _ensure_even_temporal(_ensure_spatial_div(mask_lat))
-        mask_vae   = _ensure_even_temporal(_ensure_spatial_div(mask_vae))
+        # Spatial dims must be divisible by SPATIAL_PATCH (2).
+        # Temporal dim is intentionally NOT padded here: when latT==1 the
+        # VoidTransformer pads to T=2 with zeros internally (matching the
+        # training convention — the second frame is always zeros, not noise).
+        lat      = _ensure_spatial_div(lat)
+        mask_pad = _ensure_spatial_div(mask_lat)
+        mask_vae = _ensure_spatial_div(mask_vae)
 
         T_eff, H_eff, W_eff = lat.shape[2], lat.shape[3], lat.shape[4]
 
@@ -336,6 +342,10 @@ class VoidSampler:
         # ── 6. Text conditioning ───────────────────────────────────────────
         pos_embeds  = _extract_cond_embeds(positive).to(device=device)   # [1, S, 4096]
         neg_embeds  = _extract_cond_embeds(negative).to(device=device)
+
+        # VOID was trained with text sequences padded to exactly 226 tokens
+        pos_embeds = _pad_or_trim_text(pos_embeds, 226)
+        neg_embeds = _pad_or_trim_text(neg_embeds, 226)
 
         # Expand to batch
         pos_embeds  = pos_embeds.expand(B, -1, -1)
