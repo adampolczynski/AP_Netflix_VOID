@@ -42,6 +42,31 @@ def _load_void_model(path: str, dtype: torch.dtype, device) -> VoidTransformer:
     return model
 
 
+def _encode_mask_vae(vae, mask_bhw: torch.Tensor, T: int, device) -> torch.Tensor:
+    """Encode the mask video through the VAE → [B, 16, T', Lh, Lw].
+
+    VOID uses use_vae_mask=True: the 3rd block of 16 input channels is the
+    VAE-encoded mask video, not a broadcast binary channel. Encoding the mask
+    through the same VAE that processes the image gives the model the proper
+    16-dimensional latent representation it was trained to expect.
+
+    Mask convention: 0.0 = remove (inpaint), 1.0 = keep (background).
+    Values between 0 and 1 (overlap=63/255, affected=127/255) are preserved.
+    """
+    if mask_bhw.ndim == 2:
+        mask_bhw = mask_bhw.unsqueeze(0)            # [1, H, W]
+    B, H, W = mask_bhw.shape
+    vae_dtype = next(vae.parameters()).dtype
+    # Mask values stay in [0, 1] range — official VOID does NOT normalize to [-1, +1].
+    # The caller is responsible for inverting if needed (official: encodes 1-mask_condition).
+    mask_vid = mask_bhw.float().to(device)           # [B, H, W], range [0, 1]
+    mask_vid = mask_vid.unsqueeze(1).unsqueeze(2)    # [B, 1, 1, H, W]
+    mask_vid = mask_vid.expand(B, 3, T, H, W).to(dtype=vae_dtype)  # [B, 3, T, H, W]
+    with torch.no_grad():
+        lat = vae.encode(mask_vid)                   # [B, 16, T', Lh, Lw]
+    return lat.float()
+
+
 def _vae3d_encode(vae, image_bhwc: torch.Tensor, T: int, device) -> torch.Tensor:
     """Encode ComfyUI IMAGE frames [B*T, H, W, C] with CogVideoX 3D VAE.
     Returns latent [B, 16, T', Lh, Lw] scaled by scaling_factor.
@@ -71,24 +96,29 @@ def _prepare_mask_3d(mask_bhw: torch.Tensor, target_T: int, target_H: int,
                      target_W: int, device) -> torch.Tensor:
     """Resize mask to latent resolution [B, 1, T', Lh, Lw], preserving quadmask values.
 
-    Quadmask convention (VOID):
+    Expects VOID quadmask convention (output of VoidQuadMask node):
       0.0        = primary object to remove
       63/255     = overlap of primary + affected
       127/255    = affected region (falling objects, displaced items)
       1.0        = background (keep)
 
-    A plain binary mask (0/1) is treated as: 1→remove (0.0), 0→keep (1.0).
+    NOTE: always use the VoidQuadMask node to prepare the mask before passing it here.
+    If you connect a raw ComfyUI mask (1=painted region), put an InvertMask node first.
     """
     if mask_bhw.ndim == 2:
         mask_bhw = mask_bhw.unsqueeze(0)                 # [1, H, W]
     mask_4d = mask_bhw.float().to(device).unsqueeze(1)   # [B, 1, H, W]
 
-    # Detect ComfyUI binary mask (values in {0,1}) and invert to quadmask convention:
-    # ComfyUI: 1=selected/masked → VOID: 0=remove
-    unique = mask_4d.unique()
-    is_binary = ((unique <= 0.01) | (unique >= 0.99)).all()
-    if is_binary:
-        mask_4d = 1.0 - mask_4d  # 1→0 (remove), 0→1 (keep)
+    # Debug: print mask statistics to help diagnose convention issues
+    uniq = mask_4d.unique()
+    print(f"[VOID] mask values (unique): {uniq.tolist()[:8]}  "
+          f"min={mask_4d.min():.3f}  max={mask_4d.max():.3f}  "
+          f"mean={mask_4d.mean():.3f}")
+    if mask_4d.max() < 0.5:
+        print("[VOID] WARNING: mask has no background (keep) region! "
+              "All pixels are 'remove'. Did you accidentally feed an inverted mask? "
+              "Check VoidQuadMask connections — overlap_mask should NOT be set to the "
+              "full background (InvertMask of remove_mask).")
 
     mask_ds = F.interpolate(mask_4d, size=(target_H, target_W), mode="nearest")
     mask_5d = mask_ds.unsqueeze(2).expand(-1, -1, target_T, -1, -1).contiguous()
@@ -267,22 +297,24 @@ class VoidSampler:
         # ── 2. Prepare mask ────────────────────────────────────────────────
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)           # [1, H, W]
-        mask_b = mask[:B].to(device=device)    # [B, H_img, W_img]
+        mask_b = mask[:B].to(device=device)    # [B, H_img, W_img]  (0=remove, 1=keep)
+
+        # 1-channel mask at latent resolution — for final compositing only
         mask_lat = _prepare_mask_3d(mask_b, latT, Lh, Lw, device)
-        # mask_lat: [B, 1, T', Lh, Lw]
 
-        # ── 3. Masked image latent ─────────────────────────────────────────
-        # Zero out ONLY the primary-object region (quadmask ≈ 0.0).
-        # Affected/overlap regions keep their latent values so the model can
-        # reason about physics there. Background (≈1.0) is always kept.
-        knockout = (mask_lat < 0.01).float()          # 1 where primary object is
-        masked_lat = lat * (1.0 - knockout)
-        masked_lat = masked_lat.expand(B, latC, latT, Lh, Lw)
+        # Block 2: VAE-encode the INVERTED mask.
+        # Official VOID pipeline: encode (1 - mask_condition) in [0, 1] range.
+        # Inverted: cup=1.0, background=0.0. Values stay in [0,1], NOT [-1,+1].
+        mask_vae = _encode_mask_vae(vae, 1.0 - mask_b, T, device)  # [B, 16, T', Lh, Lw]
 
-        # ── 4. Pad to model grid requirements ─────────────────────────────
+        # Block 3: full original video latent (zero_out_mask_region=False).
+        # Official VOID: the model sees the cup as context and generates the background.
+        # No cup-zeroing — just use lat as-is.
+
+        # ── 3. Pad to model grid requirements ─────────────────────────────
         lat        = _ensure_even_temporal(_ensure_spatial_div(lat))
-        masked_lat = _ensure_even_temporal(_ensure_spatial_div(masked_lat))
         mask_pad   = _ensure_even_temporal(_ensure_spatial_div(mask_lat))
+        mask_vae   = _ensure_even_temporal(_ensure_spatial_div(mask_vae))
 
         T_eff, H_eff, W_eff = lat.shape[2], lat.shape[3], lat.shape[4]
 
@@ -316,18 +348,19 @@ class VoidSampler:
             mm.throw_exception_if_processing_interrupted()
 
         out_lat = ddim_sample(
-            model         = void_model,
-            x_T           = x_T,
-            masked_lat    = masked_lat.to(dtype=torch.float32),
-            mask          = mask_pad,
-            cond_embeds   = pos_embeds,
-            uncond_embeds = neg_embeds,
-            num_steps     = steps,
-            cfg_scale     = cfg,
-            eta           = eta,
-            device        = device,
-            dtype         = dtype,
-            callback      = _progress,
+            model          = void_model,
+            x_T            = x_T,
+            mask_vae_lat   = mask_vae,
+            video_ref_lat  = lat.to(dtype=torch.float32),
+            compose_mask   = mask_pad,
+            cond_embeds    = pos_embeds,
+            uncond_embeds  = neg_embeds,
+            num_steps      = steps,
+            cfg_scale      = cfg,
+            eta            = eta,
+            device         = device,
+            dtype          = dtype,
+            callback       = _progress,
         )
         # out_lat: [B, 16, T_eff, H_eff, W_eff]
 

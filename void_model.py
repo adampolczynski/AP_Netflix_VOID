@@ -471,13 +471,13 @@ def _unpatch3d(tokens: torch.Tensor, B: int, T_p: int, H_p: int, W_p: int) -> to
 # Noise schedule helpers (CogVideoX-5B defaults)
 # ---------------------------------------------------------------------------
 
-def _betas_scaled_linear(num_train=1000, beta_start=0.00085, beta_end=0.012) -> torch.Tensor:
-    """sqrt(linear) schedule (=scaled_linear in diffusers)."""
-    return torch.linspace(beta_start**0.5, beta_end**0.5, num_train) ** 2
+def _betas_linear(num_train=1000, beta_start=0.00085, beta_end=0.012) -> torch.Tensor:
+    """Linear beta schedule — CogVideoX-Fun / VOID default (DDIMScheduler)."""
+    return torch.linspace(beta_start, beta_end, num_train)
 
 
 def build_alphas_cumprod(num_train: int = 1000) -> torch.Tensor:
-    betas = _betas_scaled_linear(num_train)
+    betas = _betas_linear(num_train)
     alphas = 1.0 - betas
     return torch.cumprod(alphas, dim=0)
 
@@ -515,14 +515,15 @@ def v_to_x0_eps(v_pred: torch.Tensor, x_t: torch.Tensor,
 
 @torch.no_grad()
 def ddim_sample(
-    model:        VoidTransformer,
-    x_T:          torch.Tensor,       # [B, 16, T, H, W] initial noise
-    masked_lat:   torch.Tensor,       # [B, 16, T, H, W] masked image latent
-    mask:         torch.Tensor,       # [B,  1, T, H, W] binary float mask (1=inpaint)
-    cond_embeds:  torch.Tensor,       # [B, S, 4096]
-    uncond_embeds: torch.Tensor,      # [B, S, 4096]
+    model:          VoidTransformer,
+    x_T:            torch.Tensor,        # [B, 16, T, H, W] initial noise
+    mask_vae_lat:   torch.Tensor,        # [B, 16, T, H, W] VAE-encoded inverted mask (cup=1, bkg=0)
+    video_ref_lat:  torch.Tensor,        # [B, 16, T, H, W] full original video latent (unmasked)
+    cond_embeds:    torch.Tensor,        # [B, S, 4096]
+    uncond_embeds:  torch.Tensor,        # [B, S, 4096]
+    compose_mask:   torch.Tensor = None, # [B,  1, T, H, W] float (0=inpaint, 1=keep)
     num_steps:    int   = 50,
-    cfg_scale:    float = 7.5,
+    cfg_scale:    float = 1.0,
     eta:          float = 0.0,        # 0 = deterministic DDIM
     device:       str   = "cuda",
     dtype:        torch.dtype = torch.bfloat16,
@@ -544,14 +545,13 @@ def ddim_sample(
     timesteps_t  = timesteps.flip(0)             # [T] from high to low
 
     x = x_T.to(device=device, dtype=dtype)
-    mask_16 = mask.expand_as(x)                  # [B, 16, T, H, W]
 
     for i, t_val in enumerate(timesteps_t):
         B = x.shape[0]
         t = torch.full((B,), t_val.item(), device=device, dtype=torch.float32)
 
-        # Build model input: noisy + masked + mask (48 channels)
-        model_input = torch.cat([x, masked_lat, mask_16], dim=1).to(dtype=dtype)
+        # Official VOID input order: [noisy_16ch, mask_vae_16ch, full_video_16ch]
+        model_input = torch.cat([x, mask_vae_lat, video_ref_lat], dim=1).to(dtype=dtype)
 
         # CFG forward pass
         if cfg_scale != 1.0:
@@ -597,6 +597,10 @@ def ddim_sample(
         if callback is not None:
             callback(i, x, x0)
 
-    # Keep original pixels outside the mask
-    x = x * mask_16 + masked_lat * (1 - mask_16)
+    # Hard-composite: keep original video latent where mask==1 (background).
+    # compose_mask: 0=inpaint region, 1=keep region (background).
+    if compose_mask is not None:
+        keep = compose_mask.to(device=device, dtype=x.dtype).expand_as(x)
+        x = x * (1.0 - keep) + video_ref_lat.to(dtype=x.dtype) * keep
+
     return x
