@@ -62,7 +62,7 @@ def _vae3d_decode(vae, lat_bcthw: torch.Tensor, device) -> torch.Tensor:
     vae_dtype = next(vae.parameters()).dtype
     with torch.no_grad():
         out = vae.decode(lat_bcthw.to(device=device, dtype=vae_dtype))  # [B, 3, T, H, W]
-    out = (out * 0.5 + 0.5).clamp(0, 1)
+    out = (out.float() * 0.5 + 0.5).clamp(0, 1)
     B, _, T, H, W = out.shape
     return out.permute(0, 2, 3, 4, 1).reshape(B * T, H, W, 3).cpu()
 
@@ -327,7 +327,7 @@ class VoidSampler:
             image_out = _vae3d_decode(vae, out_lat, device)   # [B*T, H, W, C]
         except Exception as e:
             print(f"[VOID] VAE decode failed: {e}. Returning blank image.")
-            image_out = torch.zeros(B * latT2, H_img, W_img, 3)
+            image_out = torch.zeros(B * latT2, H_img, W_img, 3, dtype=torch.float32)
 
         return (latent_out, image_out)
 

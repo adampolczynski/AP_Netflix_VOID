@@ -1,0 +1,16 @@
+[project]
+name = "ap-netflix-void"
+version = "1.0.0"
+description = "ComfyUI custom nodes for the Netflix VOID video inpainting model (CogVideoX-5B architecture)"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/adampolczynski/AP_Netflix_VOID"
+
+[tool.comfy]
+PublisherId = "adampolczynski"
+DisplayName = "AP Netflix VOID"
+Icon = ""
+Tags = ["video", "inpainting", "cogvideox", "void", "netflix"]
