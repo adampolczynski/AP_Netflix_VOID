@@ -9,6 +9,16 @@ Built on [CogVideoX-Fun-V1.5-5b-InP](https://huggingface.co/alibaba-pai/CogVideo
 
 ---
 
+## Example
+
+| Input | Output |
+|-------|--------|
+| ![Input](examples/input.jpg) | ![Output](examples/output.png) |
+
+*Coffee cup removed from a wooden table using Pass 1 at 672×384, 1 frame, 50 steps, CFG 6.0.*
+
+---
+
 ## Downloads
 
 | File | Source | Destination |
@@ -118,6 +128,10 @@ Re-decodes a VOID LATENT using the 3D VAE without re-running the sampler.
 ---
 
 ## Recommended Workflow
+
+A ready-to-use ComfyUI workflow is included: [`examples/03.04 Netflix VOID Test.json`](examples/03.04%20Netflix%20VOID%20Test.json)
+
+![Workflow](examples/example_workflow.png)
 
 ```
 [CLIPLoader T5-XXL] ──► [VOID Text Encode] ──► CONDITIONING (positive)
