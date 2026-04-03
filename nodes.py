@@ -69,13 +69,30 @@ def _vae3d_decode(vae, lat_bcthw: torch.Tensor, device) -> torch.Tensor:
 
 def _prepare_mask_3d(mask_bhw: torch.Tensor, target_T: int, target_H: int,
                      target_W: int, device) -> torch.Tensor:
-    """Resize mask to latent spatial/temporal resolution [B, 1, T', Lh, Lw]."""
+    """Resize mask to latent resolution [B, 1, T', Lh, Lw], preserving quadmask values.
+
+    Quadmask convention (VOID):
+      0.0        = primary object to remove
+      63/255     = overlap of primary + affected
+      127/255    = affected region (falling objects, displaced items)
+      1.0        = background (keep)
+
+    A plain binary mask (0/1) is treated as: 1→remove (0.0), 0→keep (1.0).
+    """
     if mask_bhw.ndim == 2:
-        mask_bhw = mask_bhw.unsqueeze(0)            # [1, H, W]
-    mask_4d = mask_bhw.unsqueeze(1).float().to(device)  # [B, 1, H, W]
+        mask_bhw = mask_bhw.unsqueeze(0)                 # [1, H, W]
+    mask_4d = mask_bhw.float().to(device).unsqueeze(1)   # [B, 1, H, W]
+
+    # Detect ComfyUI binary mask (values in {0,1}) and invert to quadmask convention:
+    # ComfyUI: 1=selected/masked → VOID: 0=remove
+    unique = mask_4d.unique()
+    is_binary = ((unique <= 0.01) | (unique >= 0.99)).all()
+    if is_binary:
+        mask_4d = 1.0 - mask_4d  # 1→0 (remove), 0→1 (keep)
+
     mask_ds = F.interpolate(mask_4d, size=(target_H, target_W), mode="nearest")
     mask_5d = mask_ds.unsqueeze(2).expand(-1, -1, target_T, -1, -1).contiguous()
-    return (mask_5d > 0.5).float()
+    return mask_5d
 
 
 def _extract_cond_embeds(conditioning) -> torch.Tensor:
@@ -218,8 +235,8 @@ class VoidSampler:
                 "negative":     ("CONDITIONING",),
                 "num_frames":   ("INT",  {"default": 1, "min": 1, "max": 32,
                                           "tooltip": "Video frames (1 = single image)"}),
-                "steps":        ("INT",  {"default": 30, "min": 1, "max": 200}),
-                "cfg":          ("FLOAT",{"default": 7.5, "min": 1.0, "max": 30.0, "step": 0.1}),
+                "steps":        ("INT",  {"default": 50, "min": 1, "max": 200}),
+                "cfg":          ("FLOAT",{"default": 1.0, "min": 1.0, "max": 20.0, "step": 0.1}),
                 "seed":         ("INT",  {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "eta":          ("FLOAT",{"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
                                           "tooltip": "0=deterministic DDIM, 1=DDPM stochastic"}),
@@ -255,7 +272,11 @@ class VoidSampler:
         # mask_lat: [B, 1, T', Lh, Lw]
 
         # ── 3. Masked image latent ─────────────────────────────────────────
-        masked_lat = lat * (1.0 - mask_lat)          # zero-out inpaint region
+        # Zero out ONLY the primary-object region (quadmask ≈ 0.0).
+        # Affected/overlap regions keep their latent values so the model can
+        # reason about physics there. Background (≈1.0) is always kept.
+        knockout = (mask_lat < 0.01).float()          # 1 where primary object is
+        masked_lat = lat * (1.0 - knockout)
         masked_lat = masked_lat.expand(B, latC, latT, Lh, Lw)
 
         # ── 4. Pad to model grid requirements ─────────────────────────────
@@ -396,6 +417,90 @@ class VoidTextEncode:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Node: VoidQuadMask
+# ──────────────────────────────────────────────────────────────────────────────
+
+class VoidQuadMask:
+    """
+    Build a VOID quadmask from separate ComfyUI mask layers.
+
+    VOID requires a 4-value mask where each pixel value encodes a semantic role:
+      0.0       (  0/255) – primary object to remove
+      63/255    ( 63/255) – overlap: primary object + affected region
+      127/255   (127/255) – affected region (objects that fall/move as a result)
+      1.0       (255/255) – background / keep
+
+    Inputs:
+      remove_mask   (required) – white = primary object to delete
+      affected_mask (optional) – white = region affected by removal (e.g. falling objects)
+      overlap_mask  (optional) – white = pixels that are both primary and affected
+
+    Priority when masks overlap: overlap > remove > affected > background.
+
+    If you only connect remove_mask, the output is a proper 2-level VOID mask
+    (remove / keep), which is sufficient for most scenes without physics interactions.
+    """
+
+    RETURN_TYPES  = ("MASK",)
+    RETURN_NAMES  = ("quadmask",)
+    FUNCTION      = "build"
+    CATEGORY      = "AP/VOID"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "remove_mask":   ("MASK",),
+            },
+            "optional": {
+                "affected_mask": ("MASK",),
+                "overlap_mask":  ("MASK",),
+            },
+        }
+
+    def build(self, remove_mask: torch.Tensor,
+              affected_mask: torch.Tensor | None = None,
+              overlap_mask:  torch.Tensor | None = None):
+
+        # Normalise all inputs to [B, H, W] float32
+        def _norm(m):
+            if m is None:
+                return None
+            return m.float() if m.ndim == 3 else m.unsqueeze(0).float()
+
+        rm = _norm(remove_mask)
+        am = _norm(affected_mask)
+        om = _norm(overlap_mask)
+
+        # Reference shape from remove mask
+        B, H, W = rm.shape
+
+        def _resize(m):
+            if m is None:
+                return None
+            if m.shape[-2:] != (H, W):
+                m = F.interpolate(m.unsqueeze(1), size=(H, W),
+                                  mode="nearest").squeeze(1)
+            return (m > 0.5)
+
+        rm_b = _resize(rm)           # bool [B,H,W]
+        am_b = _resize(am)
+        om_b = _resize(om)
+
+        # Start with background (1.0 = 255/255)
+        quad = torch.ones(B, H, W, dtype=torch.float32)
+
+        # Apply in ascending priority
+        if am_b is not None:
+            quad[am_b]  = 127.0 / 255.0
+        quad[rm_b]      = 0.0           # primary object (remove)
+        if om_b is not None:
+            quad[om_b]  = 63.0 / 255.0
+
+        return (quad,)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Node registry
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -405,6 +510,7 @@ NODE_CLASS_MAPPINGS = {
     "VoidSampler":        VoidSampler,
     "VoidLatentToVideo":  VoidLatentToVideo,
     "VoidTextEncode":     VoidTextEncode,
+    "VoidQuadMask":       VoidQuadMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -413,4 +519,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VoidSampler":        "VOID Sampler (AP)",
     "VoidLatentToVideo":  "VOID Latent → Image (AP)",
     "VoidTextEncode":     "VOID Text Encode (AP)",
+    "VoidQuadMask":       "VOID Quad Mask (AP)",
 }

@@ -13,7 +13,7 @@ Key design choices (verified from state-dict shapes):
   • Decoder norms: SpatialNorm3D (conditioning on original latent z)
   • Spatial compression: 8× (3 spatial downsamplers, 3 spatial upsamplers)
   • Temporal compression: 4× (first 2 down/up-blocks; avg-pool1d / F.interpolate)
-  • Latent channels: 16  |  scaling_factor: 1.15258426
+  • Latent channels: 16  |  scaling_factor: 0.7
 """
 
 import torch
@@ -398,7 +398,7 @@ class CogVideoX5BVAE(nn.Module):
         returns pixels: [B, 3, T, H, W] (raw, NOT clamped)
     """
 
-    SCALING_FACTOR = 1.15258426
+    SCALING_FACTOR = 0.7
 
     # Spatial / temporal compression factors
     SPATIAL_FACTOR  = 8
